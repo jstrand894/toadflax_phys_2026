@@ -1,0 +1,253 @@
+---
+title: "ASD Data"
+author: "Jackson Strand"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(spectrolab)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(tidyverse)
+
+# Tell R the path to your folder with asd data
+data_path <- "SpectroLab/data_in/"
+files <- list.files(data_path, pattern = "\\.asd$", recursive = TRUE, full.names = TRUE)
+
+# Load that data in!
+spec <- read_spectra(files, format = "asd")
+
+# clean up the ends
+spec <- spec[, 400:2400] # only take the wvls from 400-2400
+# water_bands <- (1350:1460, 1790:1960) 
+# spec <- spec[, !wavelengths(spec) %in% water_bands] # optional clean up of atmospheric bands
+
+# Get an interactive plot window!
+# plot_interactive(spec) # You should be able to see the 2 samples... but there are still 5 files for each...
+
+# Create a dataframe 
+spec_df <- as.data.frame(spec, metadata = TRUE)
+
+# average the 5 files per sample
+spec_avg <- spec_df %>% 
+  mutate(ID = gsub("_.*", "", sample_name)) %>% 
+  pivot_longer(cols = -c(sample_name, ID),
+               names_to = "wavelength", 
+               values_to = "reflectance") %>% 
+  mutate(wavelength = as.numeric(wavelength)) %>% 
+  group_by(ID, wavelength) %>% 
+  summarise(mean_refl = mean(reflectance, na.rm = TRUE), .groups = "drop")
+```
+
+
+```{r}
+source("SpectroLab/scripts/clean_ids.R")
+
+spec_avg_clean <- clean_spec_ids(spec_avg) %>% 
+  filter(rep != "E")
+
+# Pivot to wide format first
+spec_wide <- spec_avg_clean %>%
+  pivot_wider(names_from = wavelength, values_from = mean_refl, names_prefix = "w")
+
+spec_wide <- spec_wide %>%
+  mutate(
+    NDVI  = (w800 - w670) / (w800 + w670),
+    PRI   = (w531 - w570) / (w531 + w570),   # photochemical reflectance, stress-sensitive
+    WBI   = w900 / w970,                       # water band index
+    SIPI  = (w800 - w445) / (w800 - w680)     # structure-insensitive pigment index
+  )
+
+```
+
+```{r}
+library(lme4)
+library(lmerTest)
+
+# Mixed model: treatment + species as fixed effects, plant as random (repeated measures)
+m1 <- lmer(SIPI ~ treatment * species * week + (1 | plant_num), data = spec_wide)
+summary(m1)
+anova(m1)
+```
+
+```{r}
+library(emmeans)
+
+m_pri <- lmer(PRI ~ treatment * species * week + (1 | plant_num), data = spec_wide)
+
+# Compare infested vs control within each species
+emmeans(m_pri, pairwise ~ treatment | species)
+
+# Or visualize it
+emmip(m_pri, treatment ~ week | species, CIs = TRUE)
+```
+
+```{r}
+library(ggplot2)
+
+emm_df <- as.data.frame(emmeans(m_pri, ~ treatment | species))
+
+ggplot(emm_df, aes(x = species, y = emmean, fill = treatment)) +
+  geom_bar(stat = "identity", position = position_dodge(0.7), width = 0.6) +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+                position = position_dodge(0.7), width = 0.2) +
+  annotate("text", x = 2, y = max(emm_df$upper.CL) + 0.002, label = "*", size = 6) +
+  labs(x = "Species", y = "PRI (mean ± 95% CI)",
+       title = "PRI by Treatment and Species") +
+  scale_x_discrete(labels = c("d" = "Dalmatian", "y" = "Yellow")) +
+  scale_fill_manual(values = c("control" = "#7fbfff", "infested" = "#ff7f7f"),
+                    labels = c("Control", "Infested")) +
+  theme_minimal()
+```
+
+```{r}
+
+spec_wide_nona <-
+  spec_wide %>% 
+  na.omit()
+
+
+
+library(vegan)
+
+# Build spectral matrix — wavelength columns only
+spec_matrix <- spec_wide_nona %>% 
+  select(starts_with("w") & !matches("WBI|week")) %>%  # exclude WBI and week_num cols
+  as.matrix()
+
+# Metadata
+meta <- spec_wide_nona %>%
+  select(rep_id, species, treatment, week)
+
+# ---- PERMANOVA ----
+perm_full <- adonis2(spec_matrix ~ treatment * species * week,
+                     data = meta,
+                     permutations = 999,
+                     method = "euclidean",
+                     by = "margin")  # Type III — tests each term controlling for others
+print(perm_full)
+
+# ---- Check dispersion assumption ----
+dist_mat <- vegdist(spec_matrix, method = "euclidean")
+
+disp_treatment <- betadisper(dist_mat, meta$treatment)
+anova(disp_treatment)  # should be NS for PERMANOVA to be trustworthy
+
+disp_species <- betadisper(dist_mat, meta$species)
+anova(disp_species)
+
+# ---- PCA ordination ----
+pca_result <- rda(spec_matrix)
+
+pca_scores <- as.data.frame(scores(pca_result, display = "sites")) %>%
+  bind_cols(meta)
+
+# Variance explained
+pct <- summary(pca_result)$cont$importance
+pc1_var <- round(pct[2, 1] * 100, 1)
+pc2_var <- round(pct[2, 2] * 100, 1)
+
+ggplot(pca_scores, aes(x = PC1, y = PC2,
+                        color = treatment,
+                        shape = species)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_ellipse(aes(group = interaction(treatment, species)),
+               level = 0.95, linetype = "dashed") +
+  scale_color_manual(values = c("control" = "#4477AA", "infested" = "#CC3311")) +
+  scale_shape_manual(values = c("d" = 16, "y" = 17),
+                     labels = c("Dalmatian", "Yellow")) +
+  labs(title = "PCA of full reflectance spectra (400–2400nm)",
+       x = paste0("PC1 (", pc1_var, "%)"),
+       y = paste0("PC2 (", pc2_var, "%)"),
+       color = "Treatment", shape = "Species") +
+  theme_minimal()
+
+
+
+
+
+
+
+perm_full <- adonis2(spec_matrix ~ treatment * species * week,
+                     data = meta,
+                     permutations = 999,
+                     method = "euclidean",
+                     by = "terms")  # sequential — change from "margin"
+print(perm_full)
+```
+
+
+
+
+```{r}
+spec_avg_clean %>%
+  group_by(wavelength, species, treatment) %>%
+  summarise(mean = mean(mean_refl), se = sd(mean_refl)/sqrt(n())) %>%
+  ggplot(aes(x = wavelength, y = mean, color = treatment, fill = treatment)) +
+    geom_ribbon(aes(ymin = mean - se, ymax = mean + se), alpha = 0.2, color = NA) +
+    geom_line() +
+    facet_wrap(~species) +
+    labs(title = "Mean reflectance by treatment and species",
+         x = "Wavelength (nm)", y = "Reflectance") +
+    theme_minimal()
+```
+NDVI  
+PRI    
+WBI   
+SIPI
+```{r}
+# Your IDs like "d1c", "y2i" — the number is the plant/rep within species
+# You should already have plant_num, but let's make a clear rep ID
+spec_wide <- spec_wide %>%
+  mutate(rep_id = paste0(species, plant_num))  # e.g. "d1", "y2"
+
+library(lmerTest)
+
+# Convert week to numeric for slope interpretation
+spec_wide <- spec_wide %>%
+  mutate(week_num = case_when(
+    week == "wk1" ~ 1,
+    week == "wk2" ~ 2,
+    week == "wk4" ~ 4
+  ))
+
+# Random slope model — allows each rep to have its own trajectory
+m_slope <- lmer(SIPI ~ treatment * species * week_num + 
+                  (week_num | rep_id),   # rep-specific slopes over time
+                data = spec_wide)
+
+anova(m_slope)
+```
+
+
+```{r}
+# Reshape indices to long for easy faceting
+library(tidyr)
+
+spec_long_indices <- spec_wide %>%
+  select(rep_id, species, treatment, week_num, week, PRI, NDVI, WBI, SIPI) %>%
+  pivot_longer(cols = c(PRI, NDVI, WBI, SIPI), 
+               names_to = "index", values_to = "value")
+
+ggplot(spec_long_indices, aes(x = week_num, y = value, 
+                               color = treatment,
+                               group = interaction(rep_id, treatment))) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  facet_grid(index ~ species, scales = "free_y",
+             labeller = labeller(species = c("d" = "Dalmatian", "y" = "Yellow"))) +
+  scale_color_manual(values = c("control" = "#4477AA", "infested" = "#CC3311")) +
+  scale_x_continuous(breaks = c(1, 2, 4), labels = c("Wk1", "Wk2", "Wk4")) +
+  labs(title = "Spectral index trajectories by rep",
+       x = "Week", y = "Index value", color = "Treatment") +
+  theme_minimal() +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+
+
+

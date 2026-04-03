@@ -1,0 +1,608 @@
+---
+title: "6400 Data Proc"
+author: "Jackson Strand"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r library}
+library(readxl)
+library(readr)
+library(dplyr)
+library(stringr)
+library(tidyr)
+```
+
+```{r}
+clean_licor_with_samples <- function(file) {
+  raw <- read_excel(file, col_names = FALSE)
+  
+  # Find header row
+  header_row <- which(raw[[1]] == "Obs")[1]
+  
+  # Read with header
+  dat <- read_excel(file, skip = header_row - 1)
+  
+  # Remove units row (the "in"/"out" row)
+  dat <- dat[-1, ]
+  
+  colnames(dat)[1] <- "Obs"
+  colnames(dat)[2] <- "HHMMSS"
+  
+  # Extract rep and wk from filename
+  base <- basename(file)
+  rep_val <- str_extract(base, "(?<=tf[-_])[a-zA-Z]+(?=[-_]wk)")
+  wk_val  <- str_extract(base, "wk\\d+")
+  
+  dat <- dat %>%
+    mutate(
+      temp_sample_id = ifelse(
+        grepl("^Remark=", Obs),
+        str_extract(HHMMSS, "[dy]\\d+[ic]"),
+        NA_character_
+      )
+    ) %>%
+    fill(temp_sample_id, .direction = "down") %>%
+    filter(!grepl("^Remark=", Obs) | grepl("[dy]\\d+[ic]", HHMMSS)) %>%
+    rename(sample_id = temp_sample_id) %>%
+    mutate(
+      across(-c(Obs, HHMMSS, sample_id), as.numeric),
+      rep = rep_val,
+      wk  = wk_val,
+      species   = str_extract(sample_id, "^[a-zA-Z]"),
+      plant     = str_extract(sample_id, "\\d+"),
+      treatment = case_when(
+        str_extract(sample_id, "[a-zA-Z]$") == "c" ~ "control",
+        str_extract(sample_id, "[a-zA-Z]$") == "i" ~ "infested",
+        TRUE ~ NA_character_
+  )
+)
+  
+  return(dat)
+}
+```
+
+```{R run function}
+# Apply to all files
+files <- list.files("Data_XLSX", pattern = "\\.xlsx$", full.names = TRUE, recursive = TRUE, ignore.case = TRUE)
+data_list <- lapply(files, clean_licor_with_samples)
+all_data <- bind_rows(data_list)
+
+names(all_data)
+
+all_data %>%
+  summarise(across(c(sample_id, species, plant, treatment), ~sum(is.na(.))))
+```
+
+```{r changes to data}
+# forgot to put in remark for a few data collection points
+all_data <- all_data %>%
+  mutate(sample_id = case_when(
+    rep == "b" & wk == "wk4" & Obs == "1" ~ "d6i",
+    rep == "b" & wk == "wk4" & Obs == "2" ~ "d5i",
+    rep == "b" & wk == "wk4" & Obs == "3" ~ "d4i",
+    rep == "b" & wk == "wk4" & Obs == "4" ~ "d3c",
+    rep == "b" & wk == "wk4" & Obs == "5" ~ "d1i",
+    rep == "b" & wk == "wk4" & Obs == "6" ~ "d2i",
+    TRUE ~ sample_id
+  )) %>% 
+  # recompute the species, plant, treatment columns
+  mutate(
+  species   = str_extract(sample_id, "^[a-zA-Z]"),
+  plant     = str_extract(sample_id, "\\d+"),
+  treatment = case_when(
+    str_extract(sample_id, "[a-zA-Z]$") == "c" ~ "control",
+    str_extract(sample_id, "[a-zA-Z]$") == "i" ~ "infested",
+    TRUE ~ NA_character_
+  )
+) %>% 
+  mutate(sample_id = case_when(
+    rep == "a" & wk == "wk1" & Obs == "2" ~ "d1i",
+    TRUE ~ sample_id
+  )) %>% 
+  na.omit()
+
+all_data_heights <-
+read_excel("stem_heights.xlsx") %>%
+  mutate(
+    wk = paste0("wk", week),
+    rep = as.character(rep)
+  ) %>%
+  select(sample_id, rep, wk, height) %>% 
+  left_join(all_data, by = c("sample_id", "rep", "wk"))
+
+
+
+```
+
+
+```{r height model}
+# ── Option A: Height as response variable ─────────────────────────────────
+# Collapse to one row per plant per week first
+height_dat <- all_data_heights %>%
+  filter(rep != "a") %>%                        # consistent with your clean dataset
+  group_by(sample_id, rep, wk, species, treatment, plant) %>%
+  summarise(height = mean(height, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    treatment = factor(treatment, levels = c("control", "infested")),
+    species   = factor(species),
+    wk        = factor(wk, levels = c("wk1", "wk2", "wk4")),
+    rep       = factor(rep)
+  )
+
+# Check n per cell
+height_dat %>% count(treatment, species, wk)
+
+# Fit model
+model_height <- lm(
+  height ~ treatment * species * wk + rep,
+  data = height_dat
+)
+
+Anova(model_height, type = "III")
+
+# emmeans contrasts
+emm_height_species <- emmeans(model_height, pairwise ~ treatment | species, adjust = "tukey")
+emm_height_week    <- emmeans(model_height, pairwise ~ treatment | wk, adjust = "tukey")
+
+summary(emm_height_species$contrasts)
+summary(emm_height_week$contrasts)
+
+# ── Option B: Height as covariate in gas exchange models ──────────────────
+model_photo_height <- lm(
+  Photo ~ treatment * species + treatment * wk + rep + height,
+  data = filter(all_data_heights, rep != "a")
+)
+
+Anova(model_photo_height, type = "III")
+
+# Get the interaction contrasts properly — treatment effect at each week x species combo
+emm_height_full <- emmeans(model_height, 
+                            pairwise ~ treatment | species + wk, 
+                            adjust = "tukey")
+summary(emm_height_full$contrasts)
+
+```
+
+```{r stem height plot}
+dev.off()
+# Trajectory plot for stem height — mirroring the gas exchange plot structure
+ggplot(all_data_heights %>% 
+         mutate(wk = factor(wk, 
+                            levels = paste0("wk", 
+                                sort(unique(as.numeric(str_extract(wk, "\\d+"))))))), 
+       aes(x = wk, y = height, color = treatment, group = treatment)) +
+  # raw points jittered behind
+  geom_jitter(aes(group = treatment), alpha = 0.15, size = 1.2,
+              position = position_jitterdodge(jitter.width = 0.1, dodge.width = 0.3)) +
+  # mean trajectory line
+  stat_summary(fun = mean, geom = "line",
+               aes(group = treatment), linewidth = 1, position = position_dodge(0.3)) +
+  # mean point
+  stat_summary(fun = mean, geom = "point",
+               size = 3, position = position_dodge(0.3)) +
+  # SE error bars
+  stat_summary(fun.data = mean_se, geom = "errorbar",
+               width = 0.2, linewidth = 0.7, position = position_dodge(0.3)) +
+  facet_grid(rep ~ species, 
+             labeller = labeller(
+               species = c(d = "Dalmatian Toadflax", y = "Yellow Toadflax")
+             )) +
+  scale_color_manual(
+    values = c("control" = "#2196F3", "infested" = "#E53935"),
+    labels = c("Control", "Infested")
+  ) +
+  labs(
+    title   = "Stem Height Trajectories Over Time",
+    subtitle = "Mean ± SE; points show individual plants",
+    x       = "Week",
+    y       = "Stem Height (cm)",
+    color   = "Treatment"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold"),
+    legend.position  = "top",
+    panel.grid.minor = element_blank(),
+    axis.text.x      = element_text(angle = 30, hjust = 1)
+  )
+```
+
+
+
+```{R look for NAs}
+all_data %>%
+  filter(is.na(sample_id)) %>%
+  select(Obs, HHMMSS, rep, wk) %>%
+  print(n = 23)
+
+all_data %>%
+  filter(is.na(sample_id)) %>%
+  select(Obs, rep, wk, Photo, Cond) %>%
+  print(n = 22)
+
+all_data %>%
+  group_by(rep, wk) %>%
+  mutate(next_sample = lead(sample_id)) %>%
+  filter(is.na(sample_id)) %>%
+  select(Obs, HHMMSS, rep, wk, next_sample) %>%
+  print(n = 23)
+```
+
+
+```{r plot prep}
+
+plot_dat <- all_data %>%
+  # Make week ordered so it plots in the right order
+  mutate(
+    wk = factor(wk, levels = paste0("wk", sort(unique(as.numeric(str_extract(wk, "\\d+")))))),
+    treatment = factor(treatment, levels = c("control", "infested")),
+    species = factor(species)
+  ) %>%
+  # Pivot the variables you care about into long form
+  pivot_longer(
+    cols = c(Photo, Cond, Trmmol, Ci),   # adjust names to match your actual column names
+    names_to  = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(variable = recode(variable,
+    Photo  = "Photosynthesis (µmol/m²/s)",
+    Cond   = "Conductance (mol/m²/s)",
+    Trmmol = "Transpiration (mmol/m²/s)",
+    Ci     = "Ci (µmol/mol)"
+  ))
+
+```
+
+
+
+
+```{r plot}
+ggplot(plot_dat, aes(x = wk, y = value, color = treatment, group = treatment)) +
+  # raw points, jittered lightly
+  geom_jitter(aes(group = treatment), alpha = 0.15, size = 1.2,
+              position = position_jitterdodge(jitter.width = 0.1, dodge.width = 0.3)) +
+  # mean trajectory line
+  stat_summary(fun = mean, geom = "line",
+               aes(group = treatment), linewidth = 1, position = position_dodge(0.3)) +
+  # mean point on top
+  stat_summary(fun = mean, geom = "point",
+               size = 3, position = position_dodge(0.3)) +
+  # SE error bars
+  stat_summary(fun.data = mean_se, geom = "errorbar",
+               width = 0.2, linewidth = 0.7, position = position_dodge(0.3)) +
+  facet_grid(variable ~ species, scales = "free_y") +
+  scale_color_manual(
+    values = c("control" = "#2196F3", "infested" = "#E53935"),
+    labels = c("Control", "Infested")
+  ) +
+  labs(
+    title   = "Gas Exchange Trajectories Over Time",
+    subtitle = "Mean ± SE; points show individual observations",
+    x       = "Week",
+    y       = NULL,
+    color   = "Treatment"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    strip.background   = element_rect(fill = "grey92"),
+    strip.text         = element_text(face = "bold"),
+    strip.text.y       = element_text(angle = 0, hjust = 0),  # readable y-strip labels
+    legend.position    = "top",
+    panel.grid.minor   = element_blank(),
+    axis.text.x        = element_text(angle = 30, hjust = 1)
+  )
+```
+
+
+
+
+```{r model}
+library(lme4)
+library(lmerTest)   # gives p-values via Satterthwaite approximation
+library(broom.mixed)
+library(dplyr)
+
+# ── 1. Prep: ensure correct types ────────────────────────────────────────────
+model_dat <- all_data %>%
+  mutate(
+    treatment = factor(treatment, levels = c("control", "infested")),  # control = reference
+    species   = factor(species),
+    wk        = factor(wk, levels = paste0("wk", sort(unique(as.numeric(str_extract(wk, "\\d+")))))),
+    plant     = factor(plant),
+    rep       = factor(rep)
+  )
+
+# ── 2. Fit one mixed model per response variable ─────────────────────────────
+response_vars <- c("Photo", "Cond", "Trmmol", "Ci")
+
+models <- lapply(setNames(response_vars, response_vars), function(rv) {
+  formula <- as.formula(paste(
+    rv, "~ treatment * species + treatment * wk + (1 | rep/plant)"
+  ))
+  lmer(formula, data = model_dat, REML = TRUE)
+})
+
+# ── 3. ANOVA-style significance table for each model ─────────────────────────
+anova_tables <- lapply(models, anova)  # Type III F-tests via lmerTest
+anova_tables
+
+# ── 4. Tidy coefficient summaries ────────────────────────────────────────────
+coef_tables <- lapply(models, function(m) tidy(m, effects = "fixed", conf.int = TRUE))
+
+# Print each cleanly
+for (rv in response_vars) {
+  cat("\n══════════════════════════════\n")
+  cat("Response:", rv, "\n")
+  cat("══════════════════════════════\n")
+  print(anova_tables[[rv]])
+}
+
+# ── 5. Check random effects variance (are rep/plant explaining much?) ─────────
+for (rv in response_vars) {
+  cat("\nVariance components —", rv, "\n")
+  print(VarCorr(models[[rv]]))
+}
+
+# ── 6. Post-hoc contrasts (treatment effect within each species & week) ───────
+library(emmeans)
+
+# Treatment effect by species
+emm_species <- lapply(models, function(m) {
+  emmeans(m, pairwise ~ treatment | species, adjust = "tukey")
+})
+
+# Treatment effect by week
+emm_week <- lapply(models, function(m) {
+  emmeans(m, pairwise ~ treatment | wk, adjust = "tukey")
+})
+
+# Print contrasts for Photo as example (repeat for others)
+summary(emm_species$Photo$contrasts)
+summary(emm_week$Photo$contrasts)
+
+# ── 7. Quick assumption checks ────────────────────────────────────────────────
+# Run for each model — look for roughly normal, homogeneous residuals
+par(mfrow = c(2, 2))
+for (rv in response_vars) {
+  plot(models[[rv]], main = rv)           # residuals vs fitted
+  qqnorm(resid(models[[rv]]), main = rv)  # Q-Q plot
+  qqline(resid(models[[rv]]))
+}
+```
+
+
+
+
+```{r check a few things}
+# 1. How many observations per cell? Small n inflates SE dramatically
+model_dat %>%
+  count(treatment, species, wk)
+
+# 2. Look at the within-cell variance — are there outliers driving wide SE?
+model_dat %>%
+  group_by(treatment, species, wk) %>%
+  summarise(mean = mean(Photo, na.rm = TRUE),
+            sd   = sd(Photo, na.rm = TRUE),
+            n    = n(), .groups = "drop")
+
+# 3. Run the same contrasts for your other response variables
+# Sometimes Cond and Trmmol are more sensitive to infestation than Photo
+summary(emm_week$Cond$contrasts)
+summary(emm_week$Trmmol$contrasts)
+summary(emm_week$Ci$contrasts)
+
+summary(emm_species$Cond$contrasts)
+summary(emm_species$Trmmol$contrasts)
+summary(emm_species$Ci$contrasts)
+```
+
+
+```{r look for issues}
+# 1. Visualize the distribution — find the problematic observations
+model_dat %>%
+  filter(species == "d", treatment == "control") %>%
+  ggplot(aes(x = wk, y = Photo, label = paste(rep, plant, sep = "-"))) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = rep), width = 0.1, size = 2) +
+  geom_text(position = position_jitter(width = 0.1), size = 3, vjust = -0.5) +
+  labs(title = "Control species d — Photo by week", subtitle = "Looking for outliers")
+
+# 2. Flag statistically extreme values (>3 SD from group mean)
+model_dat %>%
+  group_by(treatment, species, wk) %>%
+  mutate(
+    group_mean = mean(Photo, na.rm = TRUE),
+    group_sd   = sd(Photo, na.rm = TRUE),
+    z_score    = (Photo - group_mean) / group_sd
+  ) %>%
+  filter(abs(z_score) > 3) %>%
+  select(rep, plant, wk, treatment, species, Photo, z_score)
+
+# 3. Also check overall range — are there biologically impossible values?
+model_dat %>%
+  summarise(
+    min_Photo = min(Photo, na.rm = TRUE),
+    max_Photo = max(Photo, na.rm = TRUE),
+    n_negative = sum(Photo < 0, na.rm = TRUE)
+  )
+
+# 1. Find and inspect the negative values
+model_dat %>%
+  filter(Photo < 0) %>%
+  select(rep, plant, wk, treatment, species, Photo, Cond, Trmmol, Ci)
+
+# 2. While you're at it, check the other variables for impossible values
+model_dat %>%
+  summarise(
+    across(c(Photo, Cond, Trmmol, Ci), 
+           list(min = ~min(., na.rm = TRUE), 
+                max = ~max(., na.rm = TRUE),
+                n_neg = ~sum(. < 0, na.rm = TRUE)))
+  )
+```
+
+```{r}
+# Remove the clearly bad session (rep c, wk1, species d)
+# and the borderline negative separately so you can be transparent about it
+model_dat_clean <- model_dat %>%
+  filter(
+    !(rep == "c" & wk == "wk1" & species == "d"),  # whole bad session
+    Photo >= 0                                        # catches the rep b outlier too
+  )
+
+# Confirm what you lost
+cat("Rows removed:", nrow(model_dat) - nrow(model_dat_clean))
+
+model_dat_clean %>%
+  count(treatment, species, wk) %>%
+  print(n = Inf)
+
+# Refit all models on clean data
+models_clean <- lapply(setNames(response_vars, response_vars), function(rv) {
+  formula <- as.formula(paste(
+    rv, "~ treatment * species + treatment * wk + (1 | rep/plant)"
+  ))
+  lmer(formula, data = model_dat_clean, REML = TRUE)
+})
+
+# Rerun emmeans contrasts
+emm_species_clean <- lapply(models_clean, function(m) {
+  emmeans(m, pairwise ~ treatment | species, adjust = "tukey")
+})
+
+emm_week_clean <- lapply(models_clean, function(m) {
+  emmeans(m, pairwise ~ treatment | wk, adjust = "tukey")
+})
+
+# Check Photo first to see if cleaning helped
+summary(emm_species_clean$Photo$contrasts)
+summary(emm_week_clean$Photo$contrasts)
+```
+
+```{r}
+# Check which random effect is the problem
+VarCorr(models_clean$Photo)
+
+# Almost certainly rep has ~0 variance, so test a simpler structure
+model_plant_only <- lmer(
+  Photo ~ treatment * species + treatment * wk + (1 | plant),
+  data = model_dat_clean, REML = TRUE
+)
+
+model_rep_fixed <- lmer(
+  Photo ~ treatment * species + treatment * wk + rep + (1 | plant),
+  data = model_dat_clean, REML = TRUE
+)
+
+# Compare — if rep variance was ~0, these will give similar results
+VarCorr(model_plant_only)
+anova(model_plant_only, model_rep_fixed)  # is rep worth keeping at all?
+```
+
+```{r power check}
+library(simr)
+
+# What power do you have to detect the treatment effect you observed?
+powerSim(models_clean$Photo, 
+         test = fixed("treatmentinfested", "t"),
+         nsim = 200)
+
+# What sample size would give you 80% power?
+# Extend the number of plants and simulate
+models_clean$Photo %>%
+  extend(along = "plant", n = 30) %>%
+  powerCurve(test = fixed("treatmentinfested", "t"), 
+             along = "plant", nsim = 100)
+```
+
+```{r correct model}
+# Best structure given your data: rep fixed, no random effects needed
+model_final <- lm(
+  Photo ~ treatment * species + treatment * wk + rep,
+  data = model_dat_clean
+)
+
+summary(model_final)
+anova(model_final)  # Type I — use car::Anova for Type III
+
+library(car)
+Anova(model_final, type = "III")
+
+# Rerun emmeans with this model
+emm_species_final <- emmeans(model_final, pairwise ~ treatment | species, adjust = "tukey")
+emm_week_final    <- emmeans(model_final, pairwise ~ treatment | wk, adjust = "tukey")
+
+summary(emm_species_final$contrasts)
+summary(emm_week_final$contrasts)
+
+# Fit all four response variables with same structure
+models_final <- lapply(setNames(response_vars, response_vars), function(rv) {
+  formula <- as.formula(paste(rv, "~ treatment * species + treatment * wk + rep"))
+  lm(formula, data = model_dat_clean)
+})
+
+# ANOVA tables for all
+lapply(models_final, function(m) Anova(m, type = "III"))
+
+```
+
+
+```{r}
+# Close any open graphics devices
+dev.off()
+
+# Plot one at a time — hit Enter in the console to advance each plot
+par(mfrow = c(1, 1))
+plot(models_final$Photo, which = 1)  # Residuals vs Fitted
+plot(models_final$Photo, which = 2)  # Q-Q plot
+plot(models_final$Photo, which = 3)  # Scale-Location
+plot(models_final$Photo, which = 5)  # Residuals vs Leverage
+```
+
+
+```{r}
+# Remove rep a and refit
+model_dat_norep_a <- model_dat_clean %>%
+  filter(rep != "a")
+
+# Check cell counts after removal
+model_dat_norep_a %>%
+  count(treatment, species, wk) %>%
+  print(n = Inf)
+
+# Refit all models
+models_norep_a <- lapply(setNames(response_vars, response_vars), function(rv) {
+  formula <- as.formula(paste(rv, "~ treatment * species + treatment * wk + rep"))
+  lm(formula, data = model_dat_norep_a)
+})
+
+# Type III ANOVA tables for all
+lapply(models_norep_a, function(m) Anova(m, type = "III"))
+
+# Rerun emmeans contrasts
+emm_species_nora <- lapply(models_norep_a, function(m) {
+  emmeans(m, pairwise ~ treatment | species, adjust = "tukey")
+})
+
+emm_week_nora <- lapply(models_norep_a, function(m) {
+  emmeans(m, pairwise ~ treatment | wk, adjust = "tukey")
+})
+
+# Print contrasts for all variables
+for (rv in response_vars) {
+  cat("\n══════════════════════════════\n")
+  cat("Response:", rv, "\n")
+  cat("══════════════════════════════\n")
+  cat("By species:\n")
+  print(summary(emm_species_nora[[rv]]$contrasts))
+  cat("By week:\n")
+  print(summary(emm_week_nora[[rv]]$contrasts))
+}
+```
+
+
+
