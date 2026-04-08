@@ -54,6 +54,6 @@ Analysis is conducted in R. Package dependencies will be documented in a `renv.l
 
 ## Contact
 
-Jackson Strand
-Department of Land Resources and Environmental Science
+Jackson Strand  
+Department of Land Resources and Environmental Science  
 Montana State University, Bozeman, MT
